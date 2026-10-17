@@ -142,7 +142,7 @@ GEMINI 4 ARGON
 ## Requirements
 
 - Python 3.8+
-- [Antigravity CLI (`agy`)](https://github.com/google/antigravity)
+- Antigravity CLI (`agy`)
 
 ---
 
