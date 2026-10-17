@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""
+agy-usage: Converts the output of 'agy -p /usage' to the exact visual format
+rendered by the interactive '/usage' modal in the Antigravity CLI, with an optional
+compact one-line-per-model table view.
+
+Usage:
+    agy -p /usage | agy-usage
+    agy -p /usage | agy-usage -c
+    agy-usage -c
+    agy-usage [file]
+    agy-usage (runs 'agy -p /usage' directly if no input is piped)
+"""
+
+import sys
+import os
+import re
+import glob
+import subprocess
+from datetime import datetime, timezone
+
+GROUP_METADATA = {
+    "gemini models": {
+        "title": "GEMINI MODELS",
+        "desc": "Models within this group: Gemini Flash, Gemini Pro"
+    },
+    "claude and gpt models": {
+        "title": "CLAUDE AND GPT MODELS",
+        "desc": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS"
+    },
+    "gemini 4 argon": {
+        "title": "GEMINI 4 ARGON",
+        "desc": "For paid Pro plans, Argon quota is separate. Higher Argon quota (included as part of the larger Gemini quota bucket) is available on Ultra plans."
+    }
+}
+
+NOTE_LINES = [
+    "Within each group, models share a weekly limit and a 5-hour limit. Quota is",
+    "consumed proportionally to the cost of the tokens. Thus, limits will last",
+    "longer with shorter tasks or using more cost-effective models. The 5-hour",
+    "limit smooths out aggregate demand to fairly distribute global capacity",
+    "across all users, while your weekly limit is tied directly to your individual",
+    "tier."
+]
+
+def detect_account_email():
+    """Detect current Antigravity account email from CLI logs or environment."""
+    env_email = os.environ.get("ANTIGRAVITY_EMAIL") or os.environ.get("AGY_EMAIL")
+    if env_email:
+        return env_email
+
+    log_pattern = os.path.expanduser("~/.gemini/antigravity-cli/log/cli-*.log")
+    log_files = sorted(glob.glob(log_pattern), key=os.path.getmtime, reverse=True)
+    for log_path in log_files[:10]:
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    m = re.search(r"applyAuthResult:\s*email=([^,\s]+)", line)
+                    if m:
+                        return m.group(1)
+        except Exception:
+            continue
+
+    # Fallback to git config
+    try:
+        git_email = subprocess.check_output(
+            ["git", "config", "user.email"],
+            stderr=subprocess.DEVNULL,
+            text=True
+        ).strip()
+        if git_email:
+            return git_email
+    except Exception:
+        pass
+
+    return None
+
+def parse_usage_text(text):
+    """
+    Parses 'agy -p /usage' output (tab-separated or space-aligned) into grouped quota items.
+    """
+    groups = {}
+    for line in text.splitlines():
+        line_clean = line.strip()
+        if not line_clean or line_clean.startswith("Quota:"):
+            continue
+
+        grp_name = None
+        limit_name = None
+        pct_str = None
+        reset_str = None
+
+        if "\t" in line:
+            parts = [p.strip() for p in line.split("\t") if p.strip()]
+            if len(parts) >= 4:
+                grp_name, limit_name, pct_str, reset_str = parts[:4]
+            elif len(parts) == 3:
+                grp_name, limit_name, pct_str = parts[:3]
+                reset_str = ""
+        else:
+            m = re.match(r"^\s*(.*?)\s{2,}(.*?)\s{2,}(\d+(?:\.\d+)?%)\s*(.*)$", line)
+            if m:
+                grp_name, limit_name, pct_str, reset_str = m.groups()
+
+        if not grp_name or not limit_name or not pct_str:
+            continue
+
+        g_key = grp_name.strip().lower()
+        if g_key not in groups:
+            groups[g_key] = {
+                "raw_name": grp_name.strip(),
+                "items": []
+            }
+
+        pct_val = float(pct_str.rstrip("%"))
+        groups[g_key]["items"].append({
+            "limit": limit_name.strip(),
+            "pct": pct_val,
+            "reset_str": reset_str.strip() if reset_str else ""
+        })
+
+    return groups
+
+def simplify_limit_name(name):
+    """Simplify limit name to 'Weekly' or '5 Hour'."""
+    n = name.lower()
+    if "five hour" in n or "5 hour" in n or "5-hour" in n:
+        return "5 Hour"
+    if "week" in n:
+        return "Weekly"
+    return name
+
+def format_refresh_datetime(reset_str):
+    """Format reset timestamp as local date and time."""
+    if not reset_str:
+        return "-"
+    try:
+        if "T" in reset_str:
+            dt_iso = reset_str
+            if dt_iso.endswith("Z"):
+                dt_iso = dt_iso[:-1] + "+00:00"
+            dt = datetime.fromisoformat(dt_iso)
+            local_dt = dt.astimezone()
+            return local_dt.strftime("%Y-%m-%d %H:%M %Z").strip()
+        else:
+            return reset_str
+    except Exception:
+        return reset_str
+
+def compute_refresh_text(pct, reset_str):
+    """
+    Computes refresh status string matching interactive CLI modal.
+    """
+    if pct >= 100.0:
+        return "Quota available"
+    if pct <= 0.0:
+        return "Quota exhausted"
+    if not reset_str:
+        return "Quota available"
+
+    try:
+        # ISO-8601 UTC timestamp: 2026-10-24T14:11:52Z
+        if "T" in reset_str:
+            dt_iso = reset_str
+            if dt_iso.endswith("Z"):
+                dt_iso = dt_iso[:-1] + "+00:00"
+            target_dt = datetime.fromisoformat(dt_iso)
+            now = datetime.now(timezone.utc)
+            diff = target_dt - now
+        else:
+            # Space-separated: 2026-10-24 16:11 CEST
+            dt_part = " ".join(reset_str.split()[:2])
+            target_dt = datetime.strptime(dt_part, "%Y-%m-%d %H:%M")
+            now = datetime.now()
+            diff = target_dt - now
+
+        total_seconds = max(0, int(diff.total_seconds()))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+
+        if hours > 0:
+            return f"Refreshes in {hours}h {minutes}m"
+        else:
+            return f"Refreshes in {minutes}m"
+    except Exception:
+        return f"Refreshes at {reset_str}"
+
+def format_compact_usage(groups, color=True, bar_char="█"):
+    """
+    Formats quota as a compact table:
+    One line per model limit with 25-character bar and column headers:
+    Model, Limit, Remaining, Refresh
+    """
+    C_RESET = "\033[m" if color else ""
+    C_BOLD = "\033[1m" if color else ""
+    C_DIM = "\033[2m" if color else ""
+    C_DEFAULT_DIM = "\033[39;2m" if color else ""
+
+    rows = []
+    for g_key, g_data in groups.items():
+        model_name = g_data["raw_name"]
+        for item in g_data["items"]:
+            limit_str = simplify_limit_name(item["limit"])
+            pct = item["pct"]
+            dt_str = format_refresh_datetime(item["reset_str"])
+            rows.append((model_name, limit_str, pct, dt_str))
+
+    if not rows:
+        return ""
+
+    m_width = max(len("Model"), max(len(r[0]) for r in rows))
+    l_width = max(len("Limit"), max(len(r[1]) for r in rows))
+    # Bar length is 25 chars. Total remaining column width is: '[' + 25 + '] ' + '100%' = 32
+    rem_width = 32
+
+    lines = []
+    header = f"{C_BOLD}{'Model':<{m_width}}  {'Limit':<{l_width}}  {'Remaining':<{rem_width}}  Refresh{C_RESET}"
+    lines.append(header)
+
+    for model_name, limit_str, pct, dt_str in rows:
+        bar_len = 25
+        filled = max(0, min(bar_len, int(round((pct / 100.0) * bar_len))))
+        unfilled = bar_len - filled
+
+        if pct > 20:
+            bar_color = "\033[32m" if color else ""  # Green
+        elif pct > 0:
+            bar_color = "\033[33m" if color else ""  # Yellow
+        else:
+            bar_color = "\033[31m" if color else ""  # Red
+
+        filled_blocks = bar_char * filled
+        unfilled_blocks = "░" * unfilled
+
+        pct_formatted = f"{int(round(pct)):>3d}%"
+        bar_str = f"[{bar_color}{filled_blocks}{C_DEFAULT_DIM}{unfilled_blocks}{C_RESET}] {C_DIM}{pct_formatted}{C_RESET}"
+
+        lines.append(f"{model_name:<{m_width}}  {limit_str:<{l_width}}  {bar_str}  {dt_str}")
+
+    return "\n".join(lines)
+
+def format_interactive_usage(groups, email=None, color=True, show_shortcuts=True, bar_char="█"):
+    """
+    Formats the parsed quota groups into the full interactive Antigravity CLI format.
+    """
+    C_RESET = "\033[m" if color else ""
+    C_BOLD = "\033[1m" if color else ""
+    C_DIM = "\033[2m" if color else ""
+    C_WHITE_BOLD = "\033[37;1m" if color else ""
+    C_BLUE = "\033[94m" if color else ""
+    C_BLUE_BOLD = "\033[94;1m" if color else ""
+    C_GRAY = "\033[90m" if color else ""
+    C_GRAY_NORMAL = "\033[90;22m" if color else ""
+    C_DEFAULT_DIM = "\033[39;2m" if color else ""
+
+    lines = []
+    lines.append(f"{C_WHITE_BOLD}└ Models & Quota{C_RESET}")
+    lines.append("")
+
+    if email:
+        lines.append(f"  Account: {C_BLUE}{email}{C_RESET}")
+        lines.append("")
+
+    for g_key, g_data in groups.items():
+        meta = GROUP_METADATA.get(g_key, {
+            "title": g_data["raw_name"].upper(),
+            "desc": f"Models within this group: {g_data['raw_name']}"
+        })
+
+        title = meta["title"]
+        desc = meta.get("desc")
+
+        lines.append(f"{C_BOLD}{title}{C_RESET}")
+        if desc:
+            lines.append(f"  {C_DIM}{desc}{C_RESET}")
+        lines.append("")
+
+        for item in g_data["items"]:
+            limit_name = item["limit"]
+            pct = item["pct"]
+            reset_str = item["reset_str"]
+
+            lines.append(f"  {C_BOLD}{limit_name}{C_RESET}")
+
+            # 50-character progress bar for full view
+            bar_len = 50
+            filled = max(0, min(bar_len, int(round((pct / 100.0) * bar_len))))
+            unfilled = bar_len - filled
+
+            if pct > 20:
+                bar_color = "\033[32m" if color else ""  # Green
+            elif pct > 0:
+                bar_color = "\033[33m" if color else ""  # Yellow
+            else:
+                bar_color = "\033[31m" if color else ""  # Red
+
+            filled_blocks = bar_char * filled
+            unfilled_blocks = "░" * unfilled
+
+            pct_formatted = f"{int(round(pct))}%"
+            bar_str = f"    [{bar_color}{filled_blocks}{C_DEFAULT_DIM}{unfilled_blocks}{C_RESET}] {C_DIM}{pct_formatted}{C_RESET}"
+            lines.append(bar_str)
+
+            refresh_text = compute_refresh_text(pct, reset_str)
+            lines.append(f"    {bar_color}{refresh_text}{C_RESET}")
+            lines.append("")
+
+    # Informational note box
+    for note_line in NOTE_LINES:
+        lines.append(f"  {C_GRAY}│{C_DEFAULT_DIM}{note_line}{C_RESET}")
+
+    if show_shortcuts:
+        lines.append("")
+        shortcuts = (
+            f"  {C_BLUE_BOLD}↑/↓{C_GRAY_NORMAL} Scroll · "
+            f"{C_BLUE_BOLD}pgup/pgdown{C_GRAY_NORMAL} Page · "
+            f"{C_BLUE_BOLD}ctrl+end{C_GRAY_NORMAL} Bottom · "
+            f"{C_BLUE_BOLD}ctrl+home{C_GRAY_NORMAL} Top · "
+            f"{C_BLUE_BOLD}esc{C_GRAY_NORMAL} Close{C_RESET}"
+        )
+        lines.append(shortcuts)
+
+    return "\n".join(lines)
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Convert 'agy -p /usage' output to interactive or compact table format."
+    )
+    parser.add_argument("file", nargs="?", help="Input file containing 'agy -p /usage' output (reads stdin if omitted).")
+    parser.add_argument("-c", "--compact", "--one-line", dest="compact", action="store_true",
+                        help="Show one line per model in a compact table format with shortened bar.")
+    parser.add_argument("--bar-char", default=None, help="Custom character for filled bar (default: ▇ with gap).")
+    parser.add_argument("--no-gap", "--nogap", dest="no_gap", action="store_true",
+                        help="Use solid full block '█' without top gap between rows.")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color codes.")
+    parser.add_argument("--account", help="Override displayed account email.")
+    parser.add_argument("--no-shortcuts", action="store_true", help="Omit footer keyboard shortcut hints.")
+
+    args = parser.parse_args()
+
+    # Determine input text
+    input_text = ""
+    if args.file:
+        with open(args.file, "r", encoding="utf-8") as f:
+            input_text = f.read()
+    elif not sys.stdin.isatty():
+        input_text = sys.stdin.read()
+    else:
+        try:
+            res = subprocess.run(["agy", "-p", "/usage"], capture_output=True, text=True, check=True)
+            input_text = res.stdout
+        except Exception as e:
+            sys.stderr.write(f"Error running 'agy -p /usage': {e}\n")
+            sys.exit(1)
+
+    if not input_text.strip():
+        sys.stderr.write("No quota usage data provided.\n")
+        sys.exit(1)
+
+    groups = parse_usage_text(input_text)
+    if not groups:
+        sys.stderr.write("Could not parse quota data from input.\n")
+        sys.exit(1)
+
+    use_color = not args.no_color
+    if args.bar_char:
+        bar_char = args.bar_char
+    elif args.no_gap:
+        bar_char = "█"
+    else:
+        bar_char = "▇"  # Default: gap with lower 7/8 block
+
+    if args.compact:
+        output = format_compact_usage(groups, color=use_color, bar_char=bar_char)
+    else:
+        email = args.account or detect_account_email()
+        output = format_interactive_usage(
+            groups,
+            email=email,
+            color=use_color,
+            show_shortcuts=(not args.no_shortcuts),
+            bar_char=bar_char
+        )
+
+    print(output)
+
+if __name__ == "__main__":
+    main()
